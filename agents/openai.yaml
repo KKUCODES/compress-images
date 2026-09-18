@@ -1,4 +1,4 @@
 interface:
   display_name: "Image Compressor · 图片压缩"
-  short_description: "使用 Sharp 在本地压缩单张或批量图片，保留原图并报告节省空间"
+  short_description: "本地压缩或转换图片格式，支持批量处理、自动比较体积并保留原图"
   default_prompt: "Use $compress-images to compress the selected local images and report the space saved."

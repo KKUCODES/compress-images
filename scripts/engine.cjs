@@ -64,27 +64,60 @@ async function encode(sharp, source, extension, options) {
   if (format !== expected) return { reason: 'format_extension_mismatch' };
   if ((metadata.pages || 1) > 1) return { reason: 'animated_or_multipage' };
   if (metadata.depth !== 'uchar') return { reason: 'unsupported_bit_depth' };
-  if (options.mode === 'lossless' && format === 'jpeg') return { reason: 'jpeg_lossless_unsupported' };
-  // 保留方向与色彩等元数据；不通过去掉方向标签换取更小文件。
-  const output = await input().keepMetadata().toFormat(format, settings(options.mode, options.quality, format)).timeout({ seconds: 60 }).toBuffer();
-  const decoded = sharp(output, { failOn: 'warning', limitInputPixels: maxPixels });
-  const after = await decoded.metadata();
-  if (after.width !== metadata.width || after.height !== metadata.height || (after.orientation || 1) !== (metadata.orientation || 1)) throw new Error('Output dimensions or orientation changed.');
-  if (options.mode === 'lossless') {
-    const originalPixels = await input().ensureAlpha().raw().toBuffer();
-    const outputPixels = await decoded.ensureAlpha().raw().toBuffer();
-    if (!originalPixels.equals(outputPixels)) return { reason: 'lossless_verification_failed' };
-  } else {
-    // 实际解码，不能只凭文件头认定输出可读。
-    await decoded.stats();
+  const requested = options.format ?? 'original';
+  const formats = [...new Set((requested === 'auto' ? options.formats ?? ['original', 'webp', 'avif'] : [requested])
+    .map(value => value === 'original' ? format : value))];
+  const transparent = formats.includes('jpeg') && metadata.hasAlpha && !(await input().stats()).isOpaque;
+  const originalPixels = options.mode === 'lossless' ? await input().ensureAlpha().raw().toBuffer() : undefined;
+  const candidates = [];
+  let best;
+  for (const target of formats) {
+    if (options.mode === 'lossless' && target === 'jpeg') {
+      candidates.push({ format: target, status: 'skipped', reason: 'jpeg_lossless_unsupported' });
+      continue;
+    }
+    if (target === 'jpeg' && transparent && !options.background) {
+      candidates.push({ format: target, status: 'skipped', reason: 'jpeg_background_required' });
+      continue;
+    }
+    try {
+      // 每个候选独立从原图编码，避免连续转码累积损失；只保留最小候选的缓冲区。
+      let pipeline = input().keepMetadata();
+      if (target === 'jpeg' && options.background) pipeline = pipeline.flatten({ background: options.background });
+      const output = await pipeline.toFormat(target, settings(options.mode, options.quality, target)).timeout({ seconds: 60 }).toBuffer();
+      const decoded = sharp(output, { failOn: 'warning', limitInputPixels: maxPixels });
+      const after = await decoded.metadata();
+      const actualFormat = after.format === 'heif' && after.compression === 'av1' ? 'avif' : after.format;
+      // 保留方向与色彩等元数据；不通过去掉方向标签换取更小文件。
+      if (actualFormat !== target || after.width !== metadata.width || after.height !== metadata.height || (after.orientation || 1) !== (metadata.orientation || 1)) throw new Error('Output format, dimensions or orientation changed.');
+      if (originalPixels) {
+        const outputPixels = await decoded.ensureAlpha().raw().toBuffer();
+        if (!originalPixels.equals(outputPixels)) {
+          candidates.push({ format: target, status: 'skipped', reason: 'lossless_verification_failed' });
+          continue;
+        }
+      } else {
+        // 实际解码，不能只凭文件头认定输出可读。
+        await decoded.stats();
+      }
+      candidates.push({ format: target, status: 'encoded', bytes: output.length });
+      if (!best || output.length < best.output.length) best = { output, outputFormat: target };
+    } catch (error) {
+      candidates.push({ format: target, status: 'failed', reason: 'encoding_failed', message: error.message });
+    }
   }
-  return { output };
+  if (!best && candidates.some(candidate => candidate.status === 'failed')) {
+    return { failed: true, reason: 'no_valid_output', inputFormat: format, candidates };
+  }
+  return best ? { ...best, inputFormat: format, candidates }
+    : { reason: candidates[0]?.reason ?? 'no_valid_output', inputFormat: format, candidates };
 }
 
-async function writeCopy(item, output, options) {
+async function writeCopy(item, output, options, outputFormat, inputFormat) {
   const destination = options.outputDir ? path.join(options.outputDir, item.relative) : item.input;
-  const extension = path.extname(destination);
-  const stem = destination.slice(0, -extension.length);
+  const originalExtension = path.extname(destination);
+  const extension = outputFormat === inputFormat ? originalExtension : `.${outputFormat === 'jpeg' ? 'jpg' : outputFormat}`;
+  const stem = destination.slice(0, -originalExtension.length);
   await fs.mkdir(path.dirname(destination), { recursive: true });
   for (let index = 0; index < 10000; index++) {
     const filename = `${stem}${options.suffix}${index ? `.${index}` : ''}${extension}`;
@@ -113,14 +146,17 @@ async function compressOne(sharp, item, options) {
     if (stat.size > maxBytes) return { ...item, status: 'skipped', reason: 'file_too_large' };
     const source = await fs.readFile(item.input);
     if (source.length > maxBytes) return { ...item, status: 'skipped', reason: 'file_too_large' };
-    const { output, reason } = await encode(sharp, source, path.extname(item.input).toLowerCase(), options);
-    const result = { ...item, beforeBytes: source.length };
-    if (reason) return { ...result, status: 'skipped', reason };
-    if (output.length >= source.length) return { ...result, status: 'skipped', reason: 'not_smaller' };
+    const { output, reason, failed, inputFormat, outputFormat, candidates } = await encode(sharp, source, path.extname(item.input).toLowerCase(), options);
+    const result = { ...item, beforeBytes: source.length, inputFormat, candidates };
+    if (reason) return { ...result, status: failed ? 'failed' : 'skipped', reason };
+    const converted = inputFormat !== outputFormat;
+    // 指定转换格式时，格式本身也是交付目标；自动模式仍只接受体积下降。
+    const explicitConversion = converted && options.format && !['auto', 'original'].includes(options.format);
+    if (!explicitConversion && output.length >= source.length) return { ...result, status: 'skipped', reason: 'not_smaller' };
     const current = await fs.lstat(item.input);
     if (!current.isFile() || current.isSymbolicLink() || current.size > maxBytes || !(await fs.readFile(item.input)).equals(source)) return { ...result, status: 'skipped', reason: 'source_changed' };
-    const filename = await writeCopy(item, output, options);
-    return { ...result, status: 'compressed', output: filename, afterBytes: output.length, savedBytes: source.length - output.length };
+    const filename = await writeCopy(item, output, options, outputFormat, inputFormat);
+    return { ...result, status: converted ? 'converted' : 'compressed', outputFormat, output: filename, afterBytes: output.length, savedBytes: source.length - output.length };
   } catch (error) {
     return { ...item, status: 'failed', reason: 'compression_failed', message: error.message };
   }
@@ -135,11 +171,11 @@ async function runBatch(sharp, items, options, cancelled = () => false, progress
     else results.push(await compressOne(sharp, item, options));
     progress(results.length, items.length);
   }
-  const successes = results.filter(item => item.status === 'compressed');
+  const successes = results.filter(item => ['compressed', 'converted'].includes(item.status));
   const beforeBytes = successes.reduce((sum, item) => sum + item.beforeBytes, 0);
   const afterBytes = successes.reduce((sum, item) => sum + item.afterBytes, 0);
-  return { schemaVersion: 1, mode: options.mode, dryRun: options.dryRun, cancelled: cancelled(),
-    summary: { total: results.length, compressed: successes.length, skipped: results.filter(item => item.status === 'skipped').length,
+  return { schemaVersion: 2, mode: options.mode, format: options.format ?? 'original', formats: options.format === 'auto' ? options.formats ?? ['original', 'webp', 'avif'] : undefined, dryRun: options.dryRun, cancelled: cancelled(),
+    summary: { total: results.length, compressed: results.filter(item => item.status === 'compressed').length, converted: results.filter(item => item.status === 'converted').length, skipped: results.filter(item => item.status === 'skipped').length,
       failed: results.filter(item => item.status === 'failed').length, planned: results.filter(item => item.status === 'planned').length,
       beforeBytes, afterBytes, savedBytes: beforeBytes - afterBytes, savedPercent: beforeBytes ? Number(((beforeBytes - afterBytes) / beforeBytes * 100).toFixed(2)) : 0 },
     results: results.map(({ relative, ...item }) => item) };

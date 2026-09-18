@@ -1,6 +1,6 @@
 {
   "name": "compress-images-skill-runtime",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "license": "UNLICENSED",
   "dependencies": { "sharp": "0.35.4" },

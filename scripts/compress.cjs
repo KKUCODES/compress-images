@@ -4,7 +4,7 @@ const { ensureSharp, checkNode } = require('./setup.cjs');
 const { discover, runBatch } = require('./engine.cjs');
 
 function parse(args) {
-  const options = { mode: 'lossless', suffix: '.min', dryRun: false };
+  const options = { mode: 'lossless', format: 'original', suffix: '.min', dryRun: false };
   const inputs = [];
   let positional = false;
   for (let index = 0; index < args.length; index++) {
@@ -14,7 +14,7 @@ function parse(args) {
     if (arg === '--help' || arg === '-h') return { help: true };
     if (arg === '--setup') { options.setup = true; continue; }
     if (arg === '--dry-run') { options.dryRun = true; continue; }
-    const key = { '--mode': 'mode', '--quality': 'quality', '--suffix': 'suffix', '--output-dir': 'outputDir' }[arg];
+    const key = { '--mode': 'mode', '--quality': 'quality', '--format': 'format', '--formats': 'formats', '--background': 'background', '--suffix': 'suffix', '--output-dir': 'outputDir' }[arg];
     if (key) {
       const value = args[++index];
       if (!value || value.startsWith('--')) throw new Error(`Missing value for ${arg}`);
@@ -23,6 +23,15 @@ function parse(args) {
     else inputs.push(arg);
   }
   if (!['lossless', 'balanced', 'small'].includes(options.mode)) throw new Error('Mode must be lossless, balanced or small.');
+  if (options.format === 'jpg') options.format = 'jpeg';
+  if (!['original', 'auto', 'png', 'jpeg', 'webp', 'avif'].includes(options.format)) throw new Error('Format must be original, auto, png, jpeg, webp or avif.');
+  if (options.formats !== undefined) {
+    if (options.format !== 'auto') throw new Error('--formats requires --format auto.');
+    options.formats = [...new Set(options.formats.split(',').map(value => value.trim() === 'jpg' ? 'jpeg' : value.trim()))];
+    if (options.formats.some(value => !['original', 'png', 'jpeg', 'webp', 'avif'].includes(value))) throw new Error('Candidate formats must be a comma-separated list of original, png, jpeg, webp or avif.');
+  }
+  if (options.mode === 'lossless' && options.format === 'jpeg') throw new Error('JPEG output requires balanced or small mode; lossless JPEG encoding is unsupported.');
+  if (options.background !== undefined && (options.format !== 'jpeg' || !/^#[0-9a-fA-F]{6}$/.test(options.background))) throw new Error('--background requires --format jpeg and an opaque #RRGGBB color.');
   if (options.quality !== undefined && (!Number.isInteger(options.quality) || options.quality < 1 || options.quality > 100 || options.mode === 'lossless')) throw new Error('Quality must be 1..100 and requires balanced or small mode.');
   if (!/^\.[a-zA-Z0-9_-]+$/.test(options.suffix)) throw new Error('Suffix must start with a dot and contain only letters, numbers, underscores or hyphens.');
   if (options.outputDir) options.outputDir = path.resolve(options.outputDir);
@@ -36,7 +45,7 @@ async function main() {
     checkNode();
     const parsed = parse(process.argv.slice(2));
     if (parsed.help) {
-      process.stdout.write('Usage: node compress.cjs [--mode lossless|balanced|small] [--quality 1..100] [--output-dir DIR] [--suffix .min] [--dry-run] -- FILE_OR_DIR...\n       node compress.cjs --setup\nOutputs JSON. Originals are preserved. Folders include subfolders.\n');
+      process.stdout.write('Usage: node compress.cjs [--mode lossless|balanced|small] [--quality 1..100] [--format original|auto|png|jpeg|webp|avif] [--formats original,webp,avif] [--background "#RRGGBB"] [--output-dir DIR] [--suffix .min] [--dry-run] -- FILE_OR_DIR...\n       node compress.cjs --setup\nOutputs JSON. Originals are preserved. Folders include subfolders.\nDefault format: original. Auto saves only smaller results. Explicit format conversion may produce a larger file.\n--formats restricts auto candidates. Transparent JPEG conversion requires --background.\n');
       return;
     }
     const { inputs, options } = parsed;
@@ -59,7 +68,7 @@ async function main() {
       process.exitCode = report.summary.failed ? 1 : 0;
     } finally { process.off('SIGINT', stop); process.off('SIGTERM', stop); }
   } catch (error) {
-    process.stdout.write(JSON.stringify({ schemaVersion: 1, error: { message: error.message } }) + '\n');
+    process.stdout.write(JSON.stringify({ schemaVersion: 2, error: { message: error.message } }) + '\n');
     process.exitCode = 2;
   }
 }
